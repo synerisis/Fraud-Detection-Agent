@@ -8,11 +8,78 @@ Exposes fraud risk data via:
 """
 
 import json
+import re
 from difflib import SequenceMatcher
 from mcp.server.fastmcp import FastMCP
 from data import PEOPLE, get_risk_label, get_overall_risk_label
 
 mcp = FastMCP("Fraud Detection Server")
+
+
+def _detect_identifier_types(query: str) -> set:
+    """
+    Classify which types of identifiers are present in a query string.
+    Returns a set containing any of: "name", "email", "ip", "phone", "address".
+    """
+    found = set()
+    q = query.strip()
+
+    if re.search(r'[\w.+-]+@[\w.-]+\.\w{2,}', q):
+        found.add("email")
+    if re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', q):
+        found.add("ip")
+    if re.search(r'\+\d[\d\-\s().]{6,}', q):
+        found.add("phone")
+    if re.search(
+        r'\b\d+\s+\w.+\b(?:street|st\.?|avenue|ave\.?|road|rd\.?|boulevard|blvd|'
+        r'drive|dr\.?|lane|ln|way|court|ct\.?|place|pl\.?|terrace)\b',
+        q, re.IGNORECASE
+    ):
+        found.add("address")
+
+    # Name: alphabetical text remaining after stripping all other identifiers
+    stripped = re.sub(r'[\w.+-]+@[\w.-]+\.\w{2,}', '', q)
+    stripped = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '', stripped)
+    stripped = re.sub(r'\+\d[\d\-\s().]{6,}', '', stripped).strip()
+    if stripped and re.match(r'^[A-Za-z][A-Za-z\s\'-]*$', stripped):
+        found.add("name")
+
+    return found
+
+
+def _search_database(query: str) -> list:
+    """Find all people matching any part of the query."""
+    q = query.lower().strip()
+    matches = []
+    seen = set()
+
+    for person in PEOPLE:
+        if person["id"] in seen:
+            continue
+        fields = [
+            person["name"].lower(),
+            person["phone"].lower(),
+            person["email"].lower(),
+            person["ip"].lower(),
+            person["address"].lower(),
+        ]
+        # Full query substring match
+        if any(q in field for field in fields):
+            matches.append(person)
+            seen.add(person["id"])
+            continue
+        # Token-level match for compound queries (e.g. "Alice Harmon alice@gmail.com")
+        tokens = [t for t in re.split(r'\s+', q) if len(t) > 3]
+        if tokens and any(any(tok in field for field in fields) for tok in tokens):
+            matches.append(person)
+            seen.add(person["id"])
+            continue
+        # Fuzzy name match
+        if SequenceMatcher(None, q, person["name"].lower()).ratio() > 0.7:
+            matches.append(person)
+            seen.add(person["id"])
+
+    return matches
 
 
 # ──────────────────────────────────────────────
@@ -23,31 +90,68 @@ mcp = FastMCP("Fraud Detection Server")
 def lookup_person(query: str) -> str:
     """
     Primary tool. Look up any person by name, email, phone number, IP address,
-    or physical address and return their complete profile with full fraud risk
-    analysis in a single call. Use this for every question about a person or
-    contact identifier. Returns identity details, per-channel risk scores
-    (phone, email, IP, address), overall risk level, and fraud signals.
-    """
-    q = query.lower().strip()
-    matches = []
+    or physical address. Behaviour depends on what identifiers are provided:
 
-    for person in PEOPLE:
-        fields = [
-            person["name"].lower(),
-            person["phone"].lower(),
-            person["email"].lower(),
-            person["ip"].lower(),
-            person["address"].lower(),
-        ]
-        if any(q in field for field in fields):
-            matches.append(person)
-            continue
-        if SequenceMatcher(None, q, person["name"].lower()).ratio() > 0.7:
-            matches.append(person)
+    - Name only: returns needs_more_info=true — the agent must ask for an
+      additional identifier (email, phone, IP, or address) before revealing
+      risk scores.
+    - Single non-name PII (email / phone / IP / address): returns only the
+      risk score for that specific channel.
+    - Name + at least one other identifier (or any two non-name identifiers):
+      returns the full profile with all channel scores, overall risk, and
+      fraud signals.
+    """
+    id_types = _detect_identifier_types(query)
+    non_name = id_types - {"name"}
+    has_name = "name" in id_types
+
+    # ── Case 1: name only — need more info ──────────────────────────────────
+    if has_name and not non_name:
+        return json.dumps({
+            "needs_more_info": True,
+            "message": (
+                "A name alone is not sufficient to run a risk check. "
+                "Please provide at least one additional identifier: "
+                "email address, phone number, IP address, or physical address."
+            ),
+        })
+
+    matches = _search_database(query)
 
     if not matches:
         return json.dumps({"found": False, "message": f"No records found matching '{query}'"})
 
+    # ── Case 2: single non-name PII only ────────────────────────────────────
+    if not has_name and len(non_name) == 1:
+        channel = next(iter(non_name))
+        channel_key_map = {
+            "email":   ("email_risk",   "email"),
+            "phone":   ("phone_risk",   "phone"),
+            "ip":      ("ip_risk",      "ip_address"),
+            "address": ("address_risk", "address"),
+        }
+        risk_key, display_key = channel_key_map[channel]
+
+        records = []
+        for p in matches:
+            risk_score = p[risk_key]
+            identifier_value = p["ip"] if channel == "ip" else p[channel]
+            records.append({
+                "id": p["id"],
+                display_key: identifier_value,
+                "channel": channel,
+                "risk_score": risk_score,
+                "risk_level": get_risk_label(risk_score),
+            })
+
+        return json.dumps({
+            "found": True,
+            "count": len(records),
+            "channel_only": True,
+            "records": records,
+        }, indent=2)
+
+    # ── Case 3: name + other identifier(s) — full profile ───────────────────
     records = []
     for p in matches:
         signals = []

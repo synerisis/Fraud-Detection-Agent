@@ -44,15 +44,23 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/v1")
 SYSTEM_PROMPT = """You are a fraud detection analyst with access to a database of 50 individuals.
 
 For any question about a person, email, phone number, IP address, or physical address:
-1. Call lookup_person with the identifier — it returns the complete profile and risk analysis in one call.
-2. Answer the user's specific question using the data returned. Include relevant risk scores,
-   risk levels, fraud signals, and end with a recommendation.
+1. Call lookup_person with exactly the identifier(s) the user provided.
+2. Interpret the result based on its type:
 
-Recommendation must be one of:
-- APPROVE   — overall_risk < 100
-- REVIEW    — overall_risk 100–249
-- DECLINE   — overall_risk 250–399
-- ESCALATE  — overall_risk >= 400
+   a) needs_more_info=true → Tell the user you need at least one more identifier
+      (email, phone, IP address, or physical address) alongside the name before
+      you can run a risk check. Do NOT reveal any scores.
+
+   b) channel_only=true → Report only the single channel score that was returned.
+      State the identifier, its risk score, and risk level. Do NOT mention overall
+      risk, other channels, or make a recommendation.
+
+   c) Full profile returned → Report all channel scores, overall risk, fraud signals,
+      and end with a recommendation:
+        - APPROVE   — overall_risk < 100
+        - REVIEW    — overall_risk 100–249
+        - DECLINE   — overall_risk 250–399
+        - ESCALATE  — overall_risk >= 400
 
 If no match is found, say so clearly. Be concise and professional."""
 
@@ -124,8 +132,20 @@ async def stream_agent(user_query: str) -> AsyncGenerator[dict[str, Any], None]:
                     for t in tools_result.tools
                 ]
 
+                # Read MCP resources and inject into system prompt
+                resource_context = ""
+                for uri in ("fraud://database/overview", "fraud://database/schema"):
+                    try:
+                        result = await session.read_resource(uri)
+                        if result.contents:
+                            resource_context += f"\n\n{result.contents[0].text}"
+                    except Exception:
+                        pass
+
+                system_content = SYSTEM_PROMPT + resource_context if resource_context else SYSTEM_PROMPT
+
                 messages: list[dict[str, Any]] = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_content},
                     {"role": "user",   "content": user_query},
                 ]
 
